@@ -1,0 +1,19 @@
+{
+  "name": "tsnode",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "ts-node src/index.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@bancor/carbon-sdk": "^0.0.97-DEV",
+    "commander": "^10.0.1",
+    "dotenv": "^16.4.5",
+    "ethers": "^5.7.2"
+  }
+}
