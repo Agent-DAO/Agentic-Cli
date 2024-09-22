@@ -121,8 +121,8 @@ program
   .option('--sellPriceLow <price>', 'New sell price low')
   .option('--sellPriceHigh <price>', 'New sell price high')
   .option('--sellBudget <amount>', 'New sell budget')
-  .option('--buyPriceMarginal <price>', 'New buy price marginal')
-  .option('--sellPriceMarginal <price>', 'New sell price marginal')
+  .option('--buyPriceMarginal <price>', 'New buy price marginal (number, "RESET", or "MAINTAIN")')
+  .option('--sellPriceMarginal <price>', 'New sell price marginal (number, "RESET", or "MAINTAIN")')
   .action(async (strategyId, options) => {
     try {
       await initSDK();
@@ -184,10 +184,15 @@ program
       // Wait for the transaction to be mined
       const receipt = await response.wait();
       console.log('Transaction receipt:', receipt);
+
     } catch (error) {
       console.error('Error updating strategy:', error);
     }
   });
+
+const TIMELOCK_ADDRESS = '0x4b339A63be892204081AdCd02ac980FA71400e01';
+const GOVERNOR_ADDRESS = '0x0395FA5e53e2a9C9528539360324Da422708aCbD';
+const VOUCHER_ADDRESS = base_config.carbon.voucher;
 
 async function proposeUpdateStrategy(governorAddress: string, strategyId: string, strategyUpdate: StrategyUpdate, buyPriceMarginal?: string, sellPriceMarginal?: string) {
   try {
@@ -196,18 +201,14 @@ async function proposeUpdateStrategy(governorAddress: string, strategyId: string
     const existingStrategy = await sdk.getStrategyById(strategyId);
     console.log('Existing strategy:', existingStrategy);
 
-    // Create the transaction data for updateStrategy
-    const carbonControllerInterface = new Interface([
-      "function updateStrategy(uint256 strategyId, bytes calldata encodedStrategy, tuple(uint256 buyPriceLow, uint256 buyPriceHigh, uint256 buyBudget, uint256 sellPriceLow, uint256 sellPriceHigh, uint256 sellBudget) update, uint256 buyPriceMarginal, uint256 sellPriceMarginal) external"
-    ]);
-
-    const updateData = carbonControllerInterface.encodeFunctionData("updateStrategy", [
+    // Use the SDK's updateStrategy method to get the transaction data
+    const tx = await sdk.updateStrategy(
       strategyId,
       existingStrategy.encoded,
       strategyUpdate,
-      buyPriceMarginal || 0,
-      sellPriceMarginal || 0
-    ]);
+      buyPriceMarginal,
+      sellPriceMarginal
+    );
 
     // Create the proposal description
     const description = `Update strategy ${strategyId}`;
@@ -219,13 +220,11 @@ async function proposeUpdateStrategy(governorAddress: string, strategyId: string
 
     // Encode the proposal function call
     const proposalData = governorInterface.encodeFunctionData("propose", [
-      [base_config.carbon.carbonController], // target address
-      [0], // value (0 ETH)
-      [updateData], // calldata
+      [base_config.carbon.carbonController],
+      [0],
+      [tx.data],
       description
     ]);
-
-    console.log('Proposal data:', proposalData);
 
     // Load private key from .env
     const privateKey = process.env.PRIVATE_KEY;
@@ -240,28 +239,27 @@ async function proposeUpdateStrategy(governorAddress: string, strategyId: string
     // Create a wallet with the new provider
     const wallet = new ethers.Wallet(privateKey, provider);
 
-    // Create contract instance
-    const governorContract = new ethers.Contract(governorAddress, governorInterface, wallet);
+    // Send the proposal transaction
+    const proposalTx = await wallet.sendTransaction({
+      to: governorAddress,
+      data: proposalData,
+      gasLimit: 1000000 // Adjust gas limit as needed
+    });
 
-    // Send the transaction
-    const tx = await governorContract.propose(
-      [base_config.carbon.carbonController],
-      [0],
-      [updateData],
-      description,
-      { gasLimit: 1000000 } // Adjust gas limit as needed
-    );
-
-    console.log('Proposal transaction sent:', tx.hash);
+    console.log('Proposal transaction sent:', proposalTx.hash);
 
     // Wait for the transaction to be mined
-    const receipt = await tx.wait();
+    const receipt = await proposalTx.wait();
     console.log('Proposal transaction receipt:', receipt);
 
     // Get the ProposalCreated event
-    const proposalCreatedEvent = receipt.events?.find((e: { event: string; }) => e.event === 'ProposalCreated');
+    const proposalCreatedEvent = receipt.logs?.find((log) => {
+      const parsedLog = governorInterface.parseLog(log);
+      return parsedLog.name === 'ProposalCreated';
+    });
     if (proposalCreatedEvent) {
-      console.log('Proposal ID:', proposalCreatedEvent.args.proposalId.toString());
+      const parsedLog = governorInterface.parseLog(proposalCreatedEvent);
+      console.log('Proposal ID:', parsedLog.args.proposalId.toString());
     }
 
   } catch (error) {
@@ -270,7 +268,7 @@ async function proposeUpdateStrategy(governorAddress: string, strategyId: string
 }
 
 program
-  .command('propose-update-strategy <governorAddress> <strategyId>')
+  .command('propose-update-strategy <strategyId>')
   .description('Propose an update to a strategy via the Governor contract')
   .option('--buyPriceLow <price>', 'New buy price low')
   .option('--buyPriceHigh <price>', 'New buy price high')
@@ -278,9 +276,9 @@ program
   .option('--sellPriceLow <price>', 'New sell price low')
   .option('--sellPriceHigh <price>', 'New sell price high')
   .option('--sellBudget <amount>', 'New sell budget')
-  .option('--buyPriceMarginal <price>', 'New buy price marginal')
-  .option('--sellPriceMarginal <price>', 'New sell price marginal')
-  .action(async (governorAddress, strategyId, options) => {
+  .option('--buyPriceMarginal <price>', 'New buy price marginal (number, "RESET", or "MAINTAIN")')
+  .option('--sellPriceMarginal <price>', 'New sell price marginal (number, "RESET", or "MAINTAIN")')
+  .action(async (strategyId, options) => {
     const strategyUpdate: StrategyUpdate = {
       buyPriceLow: options.buyPriceLow,
       buyPriceHigh: options.buyPriceHigh,
@@ -290,7 +288,56 @@ program
       sellBudget: options.sellBudget,
     };
 
-    await proposeUpdateStrategy(governorAddress, strategyId, strategyUpdate, options.buyPriceMarginal, options.sellPriceMarginal);
+    await proposeUpdateStrategy(GOVERNOR_ADDRESS, strategyId, strategyUpdate, options.buyPriceMarginal, options.sellPriceMarginal);
+  });
+
+async function transferStrategy(strategyId: string) {
+  try {
+    await initSDK();
+
+    const existingStrategy = await sdk.getStrategyById(strategyId);
+    console.log('Existing strategy:', existingStrategy);
+
+    // Load private key from .env
+    const privateKey = process.env.PRIVATE_KEY;
+    if (!privateKey) {
+      throw new Error('Private key not found in .env file');
+    }
+
+    // Create a new provider
+    const rpcUrl = 'https://mainnet.base.org';
+    const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+
+    // Create a wallet with the new provider
+    const wallet = new ethers.Wallet(privateKey, provider);
+
+    // Create the transaction data for transferFrom on the voucher contract
+    const voucherInterface = new ethers.utils.Interface([
+      "function transferFrom(address from, address to, uint256 tokenId) external"
+    ]);
+
+    // Create contract instance
+    const voucherContract = new ethers.Contract(VOUCHER_ADDRESS, voucherInterface, wallet);
+
+    // Send the transaction
+    const tx = await voucherContract.transferFrom(wallet.address, TIMELOCK_ADDRESS, strategyId, { gasLimit: 1000000 }); // Adjust gas limit as needed
+
+    console.log('Transfer strategy transaction sent:', tx.hash);
+
+    // Wait for the transaction to be mined
+    const receipt = await tx.wait();
+    console.log('Transfer strategy transaction receipt:', receipt);
+
+  } catch (error) {
+    console.error('Error transferring strategy:', error);
+  }
+}
+
+program
+  .command('transfer-strategy <strategyId>')
+  .description('Transfer a strategy to the timelock contract')
+  .action(async (strategyId) => {
+    await transferStrategy(strategyId);
   });
 
 program.parse(process.argv);
